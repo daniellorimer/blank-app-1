@@ -1,0 +1,156 @@
+# This workflow will install Python dependencies, run tests and lint with a single version of Python
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
+
+name: Python application
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.10"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 pytest
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    - name: Test with pytest
+      run: |
+        pytest
+
+        import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from datetime import datetime, timedelta
+
+# Fetch real-time MLB data from statsapi.mlb.com
+def fetch_realtime_mlb_data(date):
+    # Get today's schedule
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date.strftime('%Y-%m-%d')}"
+    response = requests.get(url)
+    if response.status_code != 200 or not response.json()["dates"]:
+        # Fallback to last regular season date (e.g., Oct 1, 2024) if no games
+        st.warning("No games today (pre-season). Using data from Oct 1, 2024.")
+        url = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2024-10-01"
+        response = requests.get(url)
+    
+    schedule = response.json()["dates"][0]["games"]
+    
+    # Collect player data for today's games
+    players_data = []
+    historical_data = []
+    
+    for game in schedule:
+        game_pk = game["gamePk"]
+        # Fetch boxscore for game (simulating historical data generation)
+        boxscore_url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+        boxscore = requests.get(boxscore_url).json()
+        
+        # Get starting pitchers' ERA
+        away_pitcher_id = game["teams"]["away"].get("probablePitcher", {}).get("id")
+        home_pitcher_id = game["teams"]["home"].get("probablePitcher", {}).get("id")
+        pitcher_eras = {}
+        for pid in [away_pitcher_id, home_pitcher_id]:
+            if pid:
+                stats_url = f"https://statsapi.mlb.com/api/v1/people/{pid}?hydrate=stats(type=season)"
+                stats = requests.get(stats_url).json()["people"][0]["stats"][0]["splits"][0]["stat"]
+                pitcher_eras[pid] = float(stats.get("era", 4.00))  # Default ERA if missing
+        
+        # Process batting stats
+        for team in ["away", "home"]:
+            team_data = boxscore["teams"][team]
+            opp_pitcher_id = home_pitcher_id if team == "away" else away_pitcher_id
+            opp_era = pitcher_eras.get(opp_pitcher_id, 4.00)
+            
+            for player in team_data["players"].values():
+                if "seasonStats" in player and "batting" in player["seasonStats"]:
+                    stats = player["seasonStats"]["batting"]
+                    batting_avg = float(stats.get("avg", ".250")[1:])  # Remove leading '.'
+                    recent_hits = int(player["stats"]["batting"].get("hits", 0))  # Hits in this game
+                    name = player["person"]["fullName"]
+                    
+                    # Add to today’s prediction data
+                    players_data.append({
+                        "name": name,
+                        "batting_avg": batting_avg,
+                        "recent_hits": recent_hits,
+                        "opp_pitcher_era": opp_era
+                    })
+                    
+                    # Simulate historical data (50 games) for training
+                    for _ in range(50):
+                        hit_prob = batting_avg * (1 - opp_era / 10)
+                        hit = 1 if np.random.random() < hit_prob else 0
+                        historical_data.append({
+                            "name": name,
+                            "batting_avg": batting_avg,
+                            "recent_hits": recent_hits,
+                            "opp_pitcher_era": opp_era,
+                            "hit": hit
+                        })
+    
+    return pd.DataFrame(historical_data), pd.DataFrame(players_data)
+
+# Train the model
+def train_model(historical_data):
+    X = historical_data[["batting_avg", "recent_hits", "opp_pitcher_era"]]
+    y = historical_data["hit"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = LogisticRegression()
+    model.fit(X_train, y_train)
+    return model
+
+# Predict hits
+def predict_hits(model, today_data):
+    X_today = today_data[["batting_avg", "recent_hits", "opp_pitcher_era"]]
+    probabilities = model.predict_proba(X_today)[:, 1]
+    today_data["hit_probability"] = probabilities
+    return today_data.sort_values("hit_probability", ascending=False)
+
+# Streamlit app
+def main():
+    st.title("MLB Hit Predictor (Real-Time)")
+    today = datetime.now()
+    st.write(f"Predictions for {today.strftime('%B %d, %Y')}")
+    
+    with st.spinner("Fetching real-time MLB data..."):
+        historical_data, today_data = fetch_realtime_mlb_data(today)
+        if today_data.empty:
+            st.error("No player data available for today.")
+            return
+        model = train_model(historical_data)
+        predictions = predict_hits(model, today_data)
+    
+    st.subheader("Top 5 Hitters Most Likely to Get a Hit Today")
+    top_5 = predictions[["name", "hit_probability"]].head(5)
+    for i, row in top_5.iterrows():
+        st.write(f"{i+1}. {row['name']} - {row['hit_probability']:.2%} chance")
+    
+    st.write("Based on season batting average, recent hits (today’s game), and opposing pitcher ERA.")
+    st.caption("Data sourced from MLB Stats API. Updates live during the season.")
+
+if __name__ == "__main__":
+    main()
